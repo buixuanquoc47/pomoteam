@@ -133,7 +133,7 @@ def logout():
 def dashboard():
     me = current_user()
     tasks = (Task.query
-             .filter(Task.assignee_id == me.id)
+             .filter(Task.assignee_id == me.id if me.role!="leader" else True)
              .order_by(Task.created_at.desc()).all())
     start_of_day = datetime.datetime.combine(datetime.date.today(), datetime.time(0,0,0))
     sessions_today = (FocusSession.query
@@ -142,9 +142,11 @@ def dashboard():
     mins_today = sum(s.actual_minutes or 0 for s in sessions_today)
     pomos_today = sum(1 for s in sessions_today if s.was_completed)
     projects = Project.query.filter_by(team_id=me.team_id).order_by(Project.name).all()
+    # cho ô assign khi leader
+    team_users = User.query.filter_by(team_id=me.team_id).all()
     return render_template("dash.html", APP_NAME="PomoTeam",
                            me=me, tasks=tasks, mins_today=mins_today,
-                           pomos_today=pomos_today, projects=projects)
+                           pomos_today=pomos_today, projects=projects, team_users=team_users)
 
 @app.route("/team")
 @login_required
@@ -178,9 +180,16 @@ def team_dashboard():
                .filter(Task.project_id.in_([p.id for p in Project.query.filter_by(team_id=me.team_id)]),
                        Task.status=="blocked")
                .order_by(Task.due_date.asc().nullslast()).all())
+    # data cho chart
+    labels = [m["user"].name or m["user"].email.split("@")[0] for m in members_stats]
+    mins = [m["focus_minutes"] for m in members_stats]
+    pomos = [m["pomos"] for m in members_stats]
+    done = [m["tasks_done"] for m in members_stats]
     return render_template("team.html", APP_NAME="PomoTeam",
                            me=me, members_stats=members_stats,
-                           blocked=blocked, start=start, rng=rng)
+                           blocked=blocked, start=start, rng=rng,
+                           chart_labels=labels, chart_mins=mins,
+                           chart_pomos=pomos, chart_done=done)
 
 # -------------------- Tasks --------------------
 @app.route("/tasks/create", methods=["POST"])
@@ -189,10 +198,14 @@ def create_task():
     me = current_user()
     title = request.form["title"].strip()
     if not title: return redirect(url_for("dashboard"))
+    # leader có thể assign cho user khác; member chỉ cho chính mình
+    assignee_id = int(request.form.get("assignee_id", me.id))
+    if me.role != "leader":
+        assignee_id = me.id
     t = Task(
         title=title,
         description=request.form.get("description","").strip() or None,
-        assignee_id=int(request.form.get("assignee_id", me.id)),
+        assignee_id=assignee_id,
         project_id=(int(request.form["project_id"]) if request.form.get("project_id") else None),
         estimate_pomos=int(request.form.get("estimate_pomos",0) or 0),
         priority=request.form.get("priority","normal"),
@@ -214,8 +227,10 @@ def update_task(task_id):
     task.priority = request.form.get("priority", task.priority)
     if request.form.get("estimate_pomos") is not None:
         task.estimate_pomos = int(request.form.get("estimate_pomos") or 0)
-    if request.form.get("assignee_id"): task.assignee_id = int(request.form["assignee_id"])
-    if request.form.get("project_id"): task.project_id = int(request.form["project_id"])
+    if request.form.get("assignee_id") and me.role=="leader":
+        task.assignee_id = int(request.form["assignee_id"])
+    if request.form.get("project_id"):
+        task.project_id = int(request.form["project_id"])
     if request.form.get("due_date") is not None:
         task.due_date = (datetime.datetime.strptime(request.form["due_date"], "%Y-%m-%d").date()
                          if request.form.get("due_date") else None)
@@ -270,7 +285,6 @@ def delete_project(pid):
     me = current_user()
     p = Project.query.get_or_404(pid)
     if p.team_id != me.team_id: abort(403)
-    # Không xoá task; chỉ bỏ liên kết project_id cho task cùng team
     for t in Task.query.filter_by(project_id=p.id).all():
         t.project_id = None
     db.session.delete(p); db.session.commit()
@@ -310,31 +324,6 @@ def finish_session():
     db.session.commit()
     return {"ok": True}
 
-# -------------------- Reports (giữ nguyên) --------------------
-@app.route("/reports/me")
-@login_required
-def my_report():
-    me = current_user()
-    frm = request.args.get("from"); to = request.args.get("to")
-    if frm and to:
-        start = datetime.datetime.fromisoformat(frm); end = datetime.datetime.fromisoformat(to)
-    else:
-        today = datetime.date.today(); monday = today - datetime.timedelta(days=today.weekday())
-        start = datetime.datetime.combine(monday, datetime.time(0,0,0)); end = datetime.datetime.utcnow()
-    sessions = (FocusSession.query
-                .filter(FocusSession.user_id==me.id, FocusSession.start_time>=start, FocusSession.start_time<=end)
-                .all())
-    focus_minutes = sum(s.actual_minutes or 0 for s in sessions)
-    pomos = sum(1 for s in sessions if s.was_completed)
-    tasks_done = Task.query.filter(Task.assignee_id==me.id, Task.status=="done").count()
-    done_tasks = Task.query.filter(Task.assignee_id==me.id, Task.status=="done").all()
-    est = sum(t.estimate_pomos or 0 for t in done_tasks) or 0
-    act = sum(t.actual_pomos or 0 for t in done_tasks) or 0
-    acc = (act/est*100) if est>0 else 0
-    return {"range":{"from":start.isoformat(),"to":end.isoformat()},
-            "focus_minutes":focus_minutes,"pomos":pomos,"tasks_done":tasks_done,
-            "estimate_accuracy_pct":round(acc,1)}
-
 # -------------------- Templates --------------------
 TPL_BASE = """
 <!doctype html>
@@ -344,30 +333,37 @@ TPL_BASE = """
 <title>{{ APP_NAME }}</title>
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.6.0/dist/confetti.browser.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <style>
-  /* Theme đỏ cam */
+  /* Theme dùng CSS variables theo mode */
   :root{
-    --red-bg:#c94b4b; /* nền */
-    --red-bg-2:#cc5a4a; /* card */
+    --bg:#c94b4b;       /* pomodoro */
+    --card:rgba(255,255,255,0.12);
     --ink:#fff;
   }
-  body { background: var(--red-bg); color: var(--ink); }
-  .navbar, .card { background: rgba(255,255,255,0.12) !important; color: var(--ink); border: none; }
+  body.mode-pomo { --bg:#c94b4b; }             /* đỏ cam */
+  body.mode-short{ --bg:#4e89ae; }             /* xanh nước biển nhẹ */
+  body.mode-long { --bg:#4caf50; }             /* xanh lá nhẹ */
+
+  body { background: var(--bg); color: var(--ink); }
+  .navbar, .card { background: var(--card) !important; color: var(--ink); border: none; }
   .form-control, .form-select, .btn, .alert { border-radius: 12px; }
   .btn-dark { background:#2b2b2b; border:none; }
   .timer { font-size: 72px; font-weight: 800; letter-spacing: 2px; }
   .timer.running { color: #00ffae; }
   .timer.done { color: #ffe082; }
   .mono { font-variant-numeric: tabular-nums; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-  .big-panel { min-height: 360px; display:flex; align-items:center; justify-content:center; }
+  .big-panel { min-height: 360px; display:flex; align-items:center; justify-content:center; flex:1; }
   .tab .btn { background:transparent; color:#fff; border:1px solid rgba(255,255,255,0.4); }
   .tab .btn.active { background:#000; }
   a, .text-muted { color:#f0f0f0 !important; }
   table thead th { color:#fff; }
   .table { color:#fff; }
+  /* Delete buttons nổi bật */
+  .btn-delete { background:#dc3545; color:#fff; border:none; }
 </style>
 </head>
-<body>
+<body class="mode-pomo">
 <nav class="navbar navbar-expand-lg shadow-sm">
   <div class="container">
     <a class="navbar-brand text-white fw-bold" href="{{ url_for('dashboard') }}">{{ APP_NAME }}</a>
@@ -407,9 +403,7 @@ async function finishSession(sessionId, completed=true, notes=''){
   return await res.json();
 }
 function boomConfetti(){
-  try{
-    confetti({particleCount:120, spread:70, origin:{y:0.6}});
-  }catch(e){}
+  try{ confetti({particleCount:120, spread:70, origin:{y:0.6}}); }catch(e){}
 }
 </script>
 </body></html>
@@ -466,9 +460,9 @@ TPL_REGISTER = """
 
 TPL_DASH = """
 {% extends 'base.html' %}{% block content %}
-<div class="row g-4">
+<div class="row g-4 align-items-stretch">
   <!-- LEFT: Big Timer -->
-  <div class="col-lg-6">
+  <div class="col-lg-6 d-flex flex-column" id="col-left">
     <div class="card shadow-sm big-panel p-4">
       <div class="w-100">
         <div class="d-flex justify-content-center gap-2 tab mb-3">
@@ -517,7 +511,7 @@ TPL_DASH = """
       <div class="card-body">
         <h5 class="mb-3">My Tasks</h5>
         <form class="row g-2" method="post" action="{{ url_for('create_task') }}">
-          <div class="col-md-4">
+          <div class="col-md-3">
             <label class="form-label">Task title</label>
             <input name="title" class="form-control" placeholder="Task title" required>
           </div>
@@ -535,7 +529,7 @@ TPL_DASH = """
             <label class="form-label">Deadline</label>
             <input name="due_date" type="date" class="form-control">
           </div>
-          <div class="col-md-2">
+          <div class="col-md-3">
             <label class="form-label">Project</label>
             <select name="project_id" class="form-select">
               <option value="">(project)</option>
@@ -546,13 +540,25 @@ TPL_DASH = """
             <label class="form-label">Description</label>
             <textarea name="description" class="form-control" placeholder="Description (optional)"></textarea>
           </div>
-          <div class="col-12"><button class="btn btn-dark">Add Task</button></div>
+
+          {% if me.role == 'leader' %}
+          <div class="col-md-4">
+            <label class="form-label">Assignee</label>
+            <select name="assignee_id" class="form-select">
+              {% for u in team_users %}
+              <option value="{{u.id}}">{{ u.name or u.email.split('@')[0] }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          {% endif %}
+
+          <div class="col-12"><button class="btn btn-dark mt-2">Add Task</button></div>
         </form>
 
         <hr>
         <div class="table-responsive">
           <table class="table align-middle">
-            <thead><tr><th>Title</th><th>Status</th><th>Est/Act</th><th>Priority</th><th>Due</th><th class="text-end">Actions</th></tr></thead>
+            <thead><tr><th>Title</th><th>Status</th><th>Est/Act</th><th>Priority</th><th>Due</th>{% if me.role=='leader' %}<th>Assignee</th>{% endif %}<th class="text-end">Actions</th></tr></thead>
             <tbody>
               {% for t in tasks %}
               <tr>
@@ -593,17 +599,34 @@ TPL_DASH = """
                            onchange="this.form.submit()">
                   </form>
                 </td>
+
+                {% if me.role=='leader' %}
+                <td>
+                  <form method="post" action="{{ url_for('update_task', task_id=t.id) }}">
+                    <input type="hidden" name="title" value="{{t.title}}">
+                    <input type="hidden" name="description" value="{{t.description or ''}}">
+                    <input type="hidden" name="status" value="{{t.status}}">
+                    <input type="hidden" name="priority" value="{{t.priority}}">
+                    <select name="assignee_id" class="form-select form-select-sm" onchange="this.form.submit()">
+                      {% for u in team_users %}
+                        <option value="{{u.id}}" {% if t.assignee_id==u.id %}selected{% endif %}>{{ u.name or u.email.split('@')[0] }}</option>
+                      {% endfor %}
+                    </select>
+                  </form>
+                </td>
+                {% endif %}
+
                 <td class="text-end">
                   <form method="post" action="{{ url_for('mark_done', task_id=t.id) }}" class="d-inline" onsubmit="setTimeout(()=>boomConfetti(),50)">
                     <button class="btn btn-sm btn-success">Done ✓</button>
                   </form>
                   <form method="post" action="{{ url_for('delete_task', task_id=t.id) }}" class="d-inline" onsubmit="return confirm('Xóa task này?');">
-                    <button class="btn btn-sm btn-outline-light ms-1">Delete</button>
+                    <button class="btn btn-sm btn-delete ms-1">Delete</button>
                   </form>
                 </td>
               </tr>
               {% else %}
-              <tr><td colspan="6" class="text-muted">No tasks yet.</td></tr>
+              <tr><td colspan="7" class="text-muted">No tasks yet.</td></tr>
               {% endfor %}
             </tbody>
           </table>
@@ -626,7 +649,7 @@ TPL_DASH = """
               <button class="btn btn-sm btn-outline-light">Save</button>
             </form>
             <form method="post" action="{{ url_for('delete_project', pid=p.id) }}" onsubmit="return confirm('Xóa project này? (tasks sẽ giữ lại nhưng bỏ liên kết project)');">
-              <button class="btn btn-sm btn-outline-danger">Delete</button>
+              <button class="btn btn-sm btn-delete">Delete</button>
             </form>
           </li>
           {% else %}
@@ -658,10 +681,11 @@ TPL_DASH = """
   function fmt(s){const m=Math.floor(s/60), r=s%60; return (m+'').padStart(2,'0')+':'+(r+'').padStart(2,'0');}
   function setMinutes(m){ m=Math.max(1, m||25); secs=m*60; elMin.value=m; elTimer.textContent=fmt(secs); }
   function setActive(tab){ [tabPom,tabShort,tabLong].forEach(b=>b.classList.remove('active')); tab.classList.add('active'); }
+  function setMode(cls){ document.body.classList.remove('mode-pomo','mode-short','mode-long'); document.body.classList.add(cls); }
 
-  tabPom.onclick=()=>{ setActive(tabPom); setMinutes(25); };
-  tabShort.onclick=()=>{ setActive(tabShort); setMinutes(5); };
-  tabLong.onclick=()=>{ setActive(tabLong); setMinutes(15); };
+  tabPom.onclick=()=>{ setActive(tabPom); setMinutes(25); setMode('mode-pomo'); };
+  tabShort.onclick=()=>{ setActive(tabShort); setMinutes(5);  setMode('mode-short'); };
+  tabLong.onclick=()=>{ setActive(tabLong); setMinutes(15); setMode('mode-long'); };
 
   elMin.addEventListener('change', e=> setMinutes(parseInt(e.target.value||25)));
 
@@ -702,7 +726,29 @@ TPL_TEAM = """
   <a class="btn btn-sm btn-outline-light" href="{{ url_for('team_dashboard', range='week') }}">Week</a>
   <a class="btn btn-sm btn-outline-light" href="{{ url_for('team_dashboard', range='month') }}">Month</a>
 </div>
-<div class="table-responsive">
+
+<div class="row g-4">
+  <div class="col-lg-6">
+    <div class="card p-3">
+      <h6>Focus Minutes by User</h6>
+      <canvas id="chartMins" height="140"></canvas>
+    </div>
+  </div>
+  <div class="col-lg-6">
+    <div class="card p-3">
+      <h6>Pomos by User</h6>
+      <canvas id="chartPomos" height="140"></canvas>
+    </div>
+  </div>
+  <div class="col-lg-6">
+    <div class="card p-3">
+      <h6>Tasks Done by User</h6>
+      <canvas id="chartDone" height="140"></canvas>
+    </div>
+  </div>
+</div>
+
+<div class="table-responsive mt-4">
 <table class="table align-middle">
   <thead><tr><th>Member</th><th>Focus mins</th><th>Pomos</th><th>Tasks done</th><th>Est. accuracy</th></tr></thead>
   <tbody>
@@ -720,6 +766,7 @@ TPL_TEAM = """
   </tbody>
 </table>
 </div>
+
 <h5 class="mt-4">Blocked Tasks</h5>
 <ul>
   {% for t in blocked %}
@@ -728,6 +775,24 @@ TPL_TEAM = """
     <li class="text-muted">No blocked tasks 🎉</li>
   {% endfor %}
 </ul>
+
+<script>
+  const labels = {{ chart_labels|tojson }};
+  const mins = {{ chart_mins|tojson }};
+  const pomos = {{ chart_pomos|tojson }};
+  const done = {{ chart_done|tojson }};
+
+  function mkBar(id, label, data){
+    new Chart(document.getElementById(id), {
+      type: 'bar',
+      data: { labels, datasets: [{ label, data }] },
+      options: { plugins:{legend:{display:false}}, scales:{y:{beginAtZero:true}} }
+    });
+  }
+  mkBar('chartMins', 'Focus minutes', mins);
+  mkBar('chartPomos', 'Pomos', pomos);
+  mkBar('chartDone', 'Tasks done', done);
+</script>
 {% endblock %}
 """
 
