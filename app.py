@@ -6,10 +6,27 @@ from jinja2 import DictLoader
 
 # -------------------- Setup --------------------
 app = Flask(__name__)
+
+# Secret key cho session
 app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "dev-secret-change-me")
-app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///pomoteam.db"
+
+# Ưu tiên DATABASE_URL (PostgreSQL trên Render). Nếu không có thì fallback SQLite.
+db_url = os.getenv("DATABASE_URL", "").strip()
+# Chuẩn hoá prefix "postgres://" -> "postgresql://"
+if db_url.startswith("postgres://"):
+    db_url = db_url.replace("postgres://", "postgresql://", 1)
+
+app.config["SQLALCHEMY_DATABASE_URI"] = db_url or "sqlite:///pomoteam.db"
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
+# Khuyến nghị cho môi trường free (tự sleep/wake): tránh lỗi kết nối "stale"
+app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
+    "pool_pre_ping": True,
+    "pool_recycle": 300,   # tái chế kết nối mỗi 5 phút
+}
+
 db = SQLAlchemy(app)
+
 
 # -------------------- Models --------------------
 class Team(db.Model):
