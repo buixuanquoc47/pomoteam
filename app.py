@@ -256,6 +256,18 @@ def delete_task(task_id):
     db.session.commit()
     return redirect(url_for("dashboard"))
 
+# -------------------- Projects --------------------
+@app.route("/projects/create", methods=["POST"], endpoint="create_project")
+@login_required
+def create_project():
+    me = current_user()
+    name = request.form["name"].strip()
+    if not name:
+        return redirect(url_for("dashboard"))
+    p = Project(team_id=me.team_id, name=name)
+    db.session.add(p); db.session.commit()
+    return redirect(url_for("dashboard"))
+
 # -------------------- Focus Sessions --------------------
 @app.route("/sessions/start", methods=["POST"])
 @login_required
