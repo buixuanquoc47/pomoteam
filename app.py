@@ -578,23 +578,40 @@ TPL_DASH = """
       <div class="card-body">
         <h5 class="mb-3">My Tasks</h5>
         <form class="row g-2" method="post" action="{{ url_for('create_task') }}">
-          <div class="col-md-4"><input name="title" class="form-control" placeholder="Task title" required></div>
-          <div class="col-md-2"><input name="estimate_pomos" type="number" min="0" class="form-control" placeholder="Est. pomos"></div>
-          <div class="col-md-2">
-            <select name="priority" class="form-select">
-              <option>normal</option><option>high</option><option>low</option>
-            </select>
-          </div>
-          <div class="col-md-2"><input name="due_date" type="date" class="form-control" placeholder="dd/mm/yyyy"></div>
-          <div class="col-md-2">
-            <select name="project_id" class="form-select">
-              <option value="">(project)</option>
-              {% for p in projects %}<option value="{{p.id}}">{{p.name}}</option>{% endfor %}
-            </select>
-          </div>
-          <div class="col-12"><textarea name="description" class="form-control" placeholder="Description (optional)"></textarea></div>
-          <div class="col-12"><button class="btn btn-dark">Add Task</button></div>
-        </form>
+  <div class="col-md-4">
+    <label class="form-label">Task title</label>
+    <input name="title" class="form-control" placeholder="Task title" required>
+  </div>
+  <div class="col-md-2">
+    <label class="form-label">Est. pomos</label>
+    <input name="estimate_pomos" type="number" min="0" class="form-control" placeholder="Est. pomos">
+  </div>
+  <div class="col-md-2">
+    <label class="form-label">Priority</label>
+    <select name="priority" class="form-select">
+      <option>normal</option><option>high</option><option>low</option>
+    </select>
+  </div>
+  <div class="col-md-2">
+    <label class="form-label">Deadline</label>
+    <input name="due_date" type="date" class="form-control">
+  </div>
+  <div class="col-md-2">
+    <label class="form-label">Project</label>
+    <select name="project_id" class="form-select">
+      <option value="">(project)</option>
+      {% for p in projects %}<option value="{{p.id}}">{{p.name}}</option>{% endfor %}
+    </select>
+  </div>
+  <div class="col-12">
+    <label class="form-label">Description</label>
+    <textarea name="description" class="form-control" placeholder="Description (optional)"></textarea>
+  </div>
+  <div class="col-12">
+    <button class="btn btn-dark">Add Task</button>
+  </div>
+</form>
+
         <hr>
         <div class="table-responsive">
           <table class="table align-middle">
