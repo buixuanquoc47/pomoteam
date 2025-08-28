@@ -66,6 +66,15 @@ class FocusSession(db.Model):
     task = db.relationship("Task")
     project = db.relationship("Project")
 
+# NEW: Notifications (simple in-app push)
+class Notification(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
+    message = db.Column(db.String(512), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+    is_read = db.Column(db.Boolean, default=False)
+    user = db.relationship("User")
+
 with app.app_context():
     db.create_all()
     if Team.query.count() == 0:
@@ -142,7 +151,6 @@ def dashboard():
     mins_today = sum(s.actual_minutes or 0 for s in sessions_today)
     pomos_today = sum(1 for s in sessions_today if s.was_completed)
     projects = Project.query.filter_by(team_id=me.team_id).order_by(Project.name).all()
-    # cho ô assign khi leader
     team_users = User.query.filter_by(team_id=me.team_id).all()
     return render_template("dash.html", APP_NAME="PomoTeam",
                            me=me, tasks=tasks, mins_today=mins_today,
@@ -176,11 +184,12 @@ def team_dashboard():
         acc = (act/est*100) if est>0 else 0
         members_stats.append(dict(user=u, focus_minutes=mins, pomos=pomos,
                                   tasks_done=tasks_done, estimate_accuracy=round(acc,1)))
+    # ranking theo focus minutes
+    members_stats.sort(key=lambda m: m["focus_minutes"], reverse=True)
     blocked = (Task.query
                .filter(Task.project_id.in_([p.id for p in Project.query.filter_by(team_id=me.team_id)]),
                        Task.status=="blocked")
                .order_by(Task.due_date.asc().nullslast()).all())
-    # data cho chart
     labels = [m["user"].name or m["user"].email.split("@")[0] for m in members_stats]
     mins = [m["focus_minutes"] for m in members_stats]
     pomos = [m["pomos"] for m in members_stats]
@@ -198,7 +207,6 @@ def create_task():
     me = current_user()
     title = request.form["title"].strip()
     if not title: return redirect(url_for("dashboard"))
-    # leader có thể assign cho user khác; member chỉ cho chính mình
     assignee_id = int(request.form.get("assignee_id", me.id))
     if me.role != "leader":
         assignee_id = me.id
@@ -257,7 +265,7 @@ def mark_done(task_id):
     db.session.commit()
     return redirect(url_for("dashboard"))
 
-# -------------------- Projects (create/update/delete) --------------------
+# -------------------- Projects (CRUD) --------------------
 @app.route("/projects/create", methods=["POST"], endpoint="create_project")
 @login_required
 def create_project():
@@ -324,6 +332,36 @@ def finish_session():
     db.session.commit()
     return {"ok": True}
 
+# -------------------- Notifications (admin remind) --------------------
+@app.route("/notify", methods=["POST"])
+@login_required
+@leader_required
+def send_notify():
+    user_id = int(request.form["user_id"])
+    msg = request.form.get("message","").strip() or "Reminder"
+    db.session.add(Notification(user_id=user_id, message=msg))
+    db.session.commit()
+    flash("Reminder sent", "success")
+    return redirect(request.referrer or url_for("dashboard"))
+
+@app.route("/notifications/pull")
+@login_required
+def pull_notifications():
+    me = current_user()
+    items = Notification.query.filter_by(user_id=me.id, is_read=False).order_by(Notification.created_at.asc()).all()
+    data = [{"id":n.id, "message":n.message, "at": n.created_at.isoformat()} for n in items]
+    return {"items": data}
+
+@app.route("/notifications/ack", methods=["POST"])
+@login_required
+def ack_notifications():
+    me = current_user()
+    ids = request.json.get("ids", [])
+    if ids:
+        Notification.query.filter(Notification.user_id==me.id, Notification.id.in_(ids)).update({"is_read": True}, synchronize_session=False)
+        db.session.commit()
+    return {"ok": True}
+
 # -------------------- Templates --------------------
 TPL_BASE = """
 <!doctype html>
@@ -335,38 +373,44 @@ TPL_BASE = """
 <script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.6.0/dist/confetti.browser.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <style>
-  /* Theme dùng CSS variables theo mode */
+  /* Theme variables */
   :root{
     --bg:#c94b4b;       /* pomodoro */
     --card:rgba(255,255,255,0.12);
     --ink:#fff;
   }
-  body.mode-pomo { --bg:#c94b4b; }             /* đỏ cam */
-  body.mode-short{ --bg:#4e89ae; }             /* xanh nước biển nhẹ */
-  body.mode-long { --bg:#4caf50; }             /* xanh lá nhẹ */
+  body.mode-pomo { --bg:#c94b4b; --card:rgba(255,255,255,0.12); --ink:#fff; }
+  body.mode-short{ --bg:#4e89ae; --card:rgba(255,255,255,0.12); --ink:#fff; }   /* xanh biển */
+  body.mode-long { --bg:#4caf50; --card:rgba(255,255,255,0.12); --ink:#fff; }   /* xanh lá */
+  body.mode-report{ --bg:#ffffff; --card:#ffffff; --ink:#212529; }              /* report trắng */
 
   body { background: var(--bg); color: var(--ink); }
   .navbar, .card { background: var(--card) !important; color: var(--ink); border: none; }
   .form-control, .form-select, .btn, .alert { border-radius: 12px; }
   .btn-dark { background:#2b2b2b; border:none; }
-  .timer { font-size: 72px; font-weight: 800; letter-spacing: 2px; }
+  .timer { font-size: clamp(72px, 12vw, 160px); font-weight: 800; letter-spacing: 2px; line-height: 1; }
   .timer.running { color: #00ffae; }
   .timer.done { color: #ffe082; }
   .mono { font-variant-numeric: tabular-nums; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-  .big-panel { min-height: 360px; display:flex; align-items:center; justify-content:center; flex:1; }
-  .tab .btn { background:transparent; color:#fff; border:1px solid rgba(255,255,255,0.4); }
-  .tab .btn.active { background:#000; }
-  a, .text-muted { color:#f0f0f0 !important; }
-  table thead th { color:#fff; }
-  .table { color:#fff; }
-  /* Delete buttons nổi bật */
+  .big-panel { min-height: 480px; display:flex; align-items:center; justify-content:center; flex:1; }
+  .tab .btn { background:transparent; color:var(--ink); border:1px solid rgba(255,255,255,0.4); }
+  .tab .btn.active { background:#000; color:#fff; }
+  a, .text-muted { color:rgba(255,255,255,0.85) !important; }
+  body.mode-report a, body.mode-report .text-muted { color:#6c757d !important; }
+  table thead th { color:var(--ink); }
+  .table { color:var(--ink); }
   .btn-delete { background:#dc3545; color:#fff; border:none; }
+  /* khung cuộn */
+  .scroll-tasks { max-height: 360px; overflow:auto; }
+  .scroll-projects { max-height: 150px; overflow:auto; }
+  /* chuyển sang màu chữ đen khi report */
+  body.mode-report .navbar, body.mode-report .card { border:1px solid #e9ecef !important; }
 </style>
 </head>
 <body class="mode-pomo">
 <nav class="navbar navbar-expand-lg shadow-sm">
   <div class="container">
-    <a class="navbar-brand text-white fw-bold" href="{{ url_for('dashboard') }}">{{ APP_NAME }}</a>
+    <a class="navbar-brand fw-bold" style="color:var(--ink)" href="{{ url_for('dashboard') }}">{{ APP_NAME }}</a>
     <div class="ms-auto">
       {% if session.get('uid') %}
         <a href="{{ url_for('team_dashboard') }}" class="btn btn-outline-light btn-sm me-2">Report</a>
@@ -540,7 +584,6 @@ TPL_DASH = """
             <label class="form-label">Description</label>
             <textarea name="description" class="form-control" placeholder="Description (optional)"></textarea>
           </div>
-
           {% if me.role == 'leader' %}
           <div class="col-md-4">
             <label class="form-label">Assignee</label>
@@ -551,12 +594,11 @@ TPL_DASH = """
             </select>
           </div>
           {% endif %}
-
           <div class="col-12"><button class="btn btn-dark mt-2">Add Task</button></div>
         </form>
 
         <hr>
-        <div class="table-responsive">
+        <div class="table-responsive scroll-tasks">
           <table class="table align-middle">
             <thead><tr><th>Title</th><th>Status</th><th>Est/Act</th><th>Priority</th><th>Due</th>{% if me.role=='leader' %}<th>Assignee</th>{% endif %}<th class="text-end">Actions</th></tr></thead>
             <tbody>
@@ -599,7 +641,6 @@ TPL_DASH = """
                            onchange="this.form.submit()">
                   </form>
                 </td>
-
                 {% if me.role=='leader' %}
                 <td>
                   <form method="post" action="{{ url_for('update_task', task_id=t.id) }}">
@@ -615,8 +656,14 @@ TPL_DASH = """
                   </form>
                 </td>
                 {% endif %}
-
                 <td class="text-end">
+                  {% if me.role=='leader' and t.assignee_id %}
+                  <form method="post" action="{{ url_for('send_notify') }}" class="d-inline">
+                    <input type="hidden" name="user_id" value="{{t.assignee_id}}">
+                    <input type="hidden" name="message" value="Reminder: {{t.title}}">
+                    <button class="btn btn-sm btn-warning">Remind</button>
+                  </form>
+                  {% endif %}
                   <form method="post" action="{{ url_for('mark_done', task_id=t.id) }}" class="d-inline" onsubmit="setTimeout(()=>boomConfetti(),50)">
                     <button class="btn btn-sm btn-success">Done ✓</button>
                   </form>
@@ -641,7 +688,7 @@ TPL_DASH = """
           <input name="name" class="form-control" placeholder="New project name" required>
           <button class="btn btn-outline-light">Add</button>
         </form>
-        <ul class="list-group list-group-flush">
+        <ul class="list-group list-group-flush scroll-projects">
           {% for p in projects %}
           <li class="list-group-item d-flex justify-content-between align-items-center" style="background:transparent;color:#fff;">
             <form method="post" action="{{ url_for('update_project', pid=p.id) }}" class="d-flex gap-2 flex-grow-1">
@@ -662,7 +709,10 @@ TPL_DASH = """
 </div>
 
 <script>
-  // Timer logic + modes
+  // Đẩy màu chữ link khi ở dashboard
+  document.querySelectorAll('a').forEach(a=>a.style.color='var(--ink)');
+
+  // Timer + modes
   const bell = new Audio("https://actions.google.com/sounds/v1/alarms/alarm_clock.ogg");
   if ("Notification" in window && Notification.permission === "default") Notification.requestPermission();
 
@@ -689,8 +739,9 @@ TPL_DASH = """
 
   elMin.addEventListener('change', e=> setMinutes(parseInt(e.target.value||25)));
 
-  function notify(msg){
+  function notifyInline(msg){
     if ("Notification" in window && Notification.permission === "granted"){ new Notification(msg); }
+    else alert(msg);
   }
 
   elStart.addEventListener('click', async ()=>{
@@ -703,7 +754,7 @@ TPL_DASH = """
         if(secs===0){ running=false; clearInterval(itv);
           elTimer.classList.remove('running'); elTimer.classList.add('done');
           try{ bell.play(); }catch(e){}
-          notify("Hết giờ!");
+          notifyInline("Hết giờ!");
           finishSession(sid,true); elStart.textContent='Start'; elPause.disabled=true; elReset.disabled=true;
         } } },1000);
     }else{
@@ -714,46 +765,65 @@ TPL_DASH = """
   });
   elPause.addEventListener('click', ()=>{ paused=!paused; elPause.textContent=paused?'Resume':'Pause';});
   elReset.addEventListener('click', ()=>{ setMinutes(parseInt(elMin.value||25)); elTimer.classList.remove('running','done');});
+
+  // ---- Pull notifications (every 20s) ----
+  async function pullNoti(){
+    try{
+      const res = await fetch("{{ url_for('pull_notifications') }}");
+      const data = await res.json();
+      if(data.items && data.items.length){
+        data.items.forEach(n=>notifyInline(n.message));
+        await fetch("{{ url_for('ack_notifications') }}",{
+          method:"POST", headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ids: data.items.map(n=>n.id)})
+        });
+      }
+    }catch(e){}
+  }
+  setInterval(pullNoti, 20000);
+  pullNoti();
 </script>
 {% endblock %}
 """
 
 TPL_TEAM = """
 {% extends 'base.html' %}{% block content %}
-<h4 class="mb-3">Team Dashboard <small class="text-muted">({{ rng }})</small></h4>
+<script>document.body.classList.remove('mode-pomo','mode-short','mode-long');document.body.classList.add('mode-report');</script>
+<h4 class="mb-3 text-dark">Team Dashboard <small class="text-muted">({{ rng }})</small></h4>
 <div class="mb-3">
-  <a class="btn btn-sm btn-outline-light" href="{{ url_for('team_dashboard', range='day') }}">Day</a>
-  <a class="btn btn-sm btn-outline-light" href="{{ url_for('team_dashboard', range='week') }}">Week</a>
-  <a class="btn btn-sm btn-outline-light" href="{{ url_for('team_dashboard', range='month') }}">Month</a>
+  <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('team_dashboard', range='day') }}">Day</a>
+  <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('team_dashboard', range='week') }}">Week</a>
+  <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('team_dashboard', range='month') }}">Month</a>
 </div>
 
 <div class="row g-4">
   <div class="col-lg-6">
     <div class="card p-3">
-      <h6>Focus Minutes by User</h6>
+      <h6 class="text-dark">Focus Minutes by User</h6>
       <canvas id="chartMins" height="140"></canvas>
     </div>
   </div>
   <div class="col-lg-6">
     <div class="card p-3">
-      <h6>Pomos by User</h6>
+      <h6 class="text-dark">Pomos by User</h6>
       <canvas id="chartPomos" height="140"></canvas>
     </div>
   </div>
   <div class="col-lg-6">
     <div class="card p-3">
-      <h6>Tasks Done by User</h6>
+      <h6 class="text-dark">Tasks Done by User</h6>
       <canvas id="chartDone" height="140"></canvas>
     </div>
   </div>
 </div>
 
 <div class="table-responsive mt-4">
-<table class="table align-middle">
-  <thead><tr><th>Member</th><th>Focus mins</th><th>Pomos</th><th>Tasks done</th><th>Est. accuracy</th></tr></thead>
+<table class="table align-middle table-striped">
+  <thead><tr><th>Rank</th><th>Member</th><th>Focus mins</th><th>Pomos</th><th>Tasks done</th><th>Est. accuracy</th></tr></thead>
   <tbody>
   {% for m in members_stats %}
     <tr>
+      <td class="mono">{{ loop.index }}</td>
       <td>{{ m.user.name or m.user.email.split("@")[0] }}</td>
       <td class="mono">{{ m.focus_minutes }}</td>
       <td class="mono">{{ m.pomos }}</td>
@@ -761,16 +831,16 @@ TPL_TEAM = """
       <td class="mono">{{ m.estimate_accuracy }}%</td>
     </tr>
   {% else %}
-    <tr><td colspan="5" class="text-muted">No members.</td></tr>
+    <tr><td colspan="6" class="text-muted">No members.</td></tr>
   {% endfor %}
   </tbody>
 </table>
 </div>
 
-<h5 class="mt-4">Blocked Tasks</h5>
+<h5 class="mt-4 text-dark">Blocked Tasks</h5>
 <ul>
   {% for t in blocked %}
-    <li><b>{{ t.title }}</b> — {{ t.assignee.name if t.assignee else 'Unassigned' }} {% if t.due_date %}(due {{ t.due_date }}){% endif %}</li>
+    <li class="text-dark"><b>{{ t.title }}</b> — {{ t.assignee.name if t.assignee else 'Unassigned' }} {% if t.due_date %}(due {{ t.due_date }}){% endif %}</li>
   {% else %}
     <li class="text-muted">No blocked tasks 🎉</li>
   {% endfor %}
@@ -782,16 +852,16 @@ TPL_TEAM = """
   const pomos = {{ chart_pomos|tojson }};
   const done = {{ chart_done|tojson }};
 
-  function mkBar(id, label, data){
+  function mkBar(id, data, color){
     new Chart(document.getElementById(id), {
       type: 'bar',
-      data: { labels, datasets: [{ label, data }] },
+      data: { labels, datasets: [{ data, backgroundColor: color }] },
       options: { plugins:{legend:{display:false}}, scales:{y:{beginAtZero:true}} }
     });
   }
-  mkBar('chartMins', 'Focus minutes', mins);
-  mkBar('chartPomos', 'Pomos', pomos);
-  mkBar('chartDone', 'Tasks done', done);
+  mkBar('chartMins', mins, '#4e79a7');
+  mkBar('chartPomos', pomos, '#59a14f');
+  mkBar('chartDone', done, '#e15759');
 </script>
 {% endblock %}
 """
