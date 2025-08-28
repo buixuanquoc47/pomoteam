@@ -1,4 +1,4 @@
-import os, datetime, functools
+import os, datetime, functools, html
 from flask import Flask, request, redirect, url_for, session, render_template, abort, flash
 from flask_sqlalchemy import SQLAlchemy
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -235,20 +235,25 @@ def update_task(task_id):
         task.assignee_id = int(request.form["assignee_id"])
     if request.form.get("project_id"):
         task.project_id = int(request.form["project_id"])
-    if request.form.get("due_date"):
-        task.due_date = datetime.datetime.strptime(request.form["due_date"], "%Y-%m-%d").date()
+    # Cập nhật hoặc xoá deadline
+    if request.form.get("due_date") is not None:
+        if request.form.get("due_date"):
+            task.due_date = datetime.datetime.strptime(request.form["due_date"], "%Y-%m-%d").date()
+        else:
+            task.due_date = None
     db.session.commit()
     return redirect(request.referrer or url_for("dashboard"))
 
-# -------------------- Projects --------------------
-@app.route("/projects/create", methods=["POST"])
+# NEW: delete task
+@app.route("/tasks/<int:task_id>/delete", methods=["POST"])
 @login_required
-def create_project():
+def delete_task(task_id):
     me = current_user()
-    name = request.form["name"].strip()
-    if not name: return redirect(url_for("dashboard"))
-    p = Project(team_id=me.team_id, name=name)
-    db.session.add(p); db.session.commit()
+    task = Task.query.get_or_404(task_id)
+    if me.role != "leader" and task.assignee_id != me.id:
+        abort(403)
+    db.session.delete(task)
+    db.session.commit()
     return redirect(url_for("dashboard"))
 
 # -------------------- Focus Sessions --------------------
@@ -356,11 +361,6 @@ def team_report():
     return {"range":{"from":start.isoformat(),"to":end.isoformat()}, "members": data}
 
 # -------------------- Templates --------------------
-TPL_BASE = """<!doctype html>..."""  # FULL base HTML từ bản trước
-TPL_LOGIN = """{% extends 'base.html' %}..."""  
-TPL_REGISTER = """{% extends 'base.html' %}..."""  
-TPL_DASH = """{% extends 'base.html' %}..."""  
-TPL_TEAM = """{% extends 'base.html' %}..."""  
 TPL_BASE = """
 <!doctype html>
 <html lang="en">
@@ -371,6 +371,8 @@ TPL_BASE = """
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
 <style>
   .timer { font-size: 56px; font-weight: 600; letter-spacing: 2px; }
+  .timer.running { color: #198754; } /* xanh success */
+  .timer.done { color: #dc3545; }    /* đỏ danger */
   .mono { font-variant-numeric: tabular-nums; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 </style>
 </head>
@@ -397,6 +399,7 @@ TPL_BASE = """
   {% block content %}{% endblock %}
 </div>
 <script>
+// Dùng cho Pomodoro AJAX
 async function startSession(taskId, planned=25){
   const res = await fetch("{{ url_for('start_session') }}", {
     method:"POST", headers:{'Content-Type':'application/x-www-form-urlencoded'},
@@ -414,6 +417,7 @@ async function finishSession(sessionId, completed=true, notes=''){
 </script>
 </body></html>
 """
+
 TPL_LOGIN = """
 {% extends 'base.html' %}{% block content %}
 <div class="row justify-content-center">
@@ -437,6 +441,7 @@ TPL_LOGIN = """
 </div>
 {% endblock %}
 """
+
 TPL_REGISTER = """
 {% extends 'base.html' %}{% block content %}
 <div class="row justify-content-center">
@@ -465,6 +470,7 @@ TPL_REGISTER = """
 </div>
 {% endblock %}
 """
+
 TPL_DASH = """
 {% extends 'base.html' %}{% block content %}
 <div class="row g-4">
@@ -484,7 +490,7 @@ TPL_DASH = """
           </div>
           <div class="mb-3">
             <label class="form-label">Minutes</label>
-            <input id="minutes" type="number" value="25" min="5" class="form-control">
+            <input id="minutes" type="number" value="25" min="1" class="form-control">
           </div>
           <div class="text-center my-3">
             <div id="timer" class="timer mono">25:00</div>
@@ -496,6 +502,19 @@ TPL_DASH = """
           </div>
         </form>
         <script>
+        // Âm thanh chuông khi hết giờ
+        const bell = new Audio("https://actions.google.com/sounds/v1/alarms/alarm_clock.ogg");
+        // Xin quyền Notification nếu có thể
+        if ("Notification" in window && Notification.permission === "default") {
+          Notification.requestPermission();
+        }
+        function notify(msg){
+          if ("Notification" in window && Notification.permission === "granted"){
+            new Notification(msg);
+          } else {
+            alert(msg);
+          }
+        }
         let secs=25*60, running=false, itv=null, sid=null, paused=false;
         const elTimer = document.getElementById('timer');
         const elMin = document.getElementById('minutes');
@@ -504,23 +523,30 @@ TPL_DASH = """
         const elReset = document.getElementById('btnReset');
         const elTask = document.getElementById('taskSelect');
         function fmt(s){const m=Math.floor(s/60), r=s%60; return (m+'').padStart(2,'0')+':'+(r+'').padStart(2,'0');}
-        function setMinutes(m){ secs=m*60; elTimer.textContent=fmt(secs); }
+        function setMinutes(m){ m=Math.max(1, m||25); secs=m*60; elTimer.textContent=fmt(secs); }
         elMin.addEventListener('change', e=> setMinutes(parseInt(e.target.value||25)));
         elStart.addEventListener('click', async ()=>{
           if(!running){
             sid = await startSession(elTask.value, parseInt(elMin.value||25));
             running=true; paused=false;
+            elTimer.classList.remove('done'); elTimer.classList.add('running');
             elPause.disabled=false; elReset.disabled=false; elStart.textContent='Stop';
             itv=setInterval(()=>{ if(!paused){ secs=Math.max(0,secs-1); elTimer.textContent=fmt(secs);
-              if(secs===0){ running=false; clearInterval(itv); finishSession(sid,true); elStart.textContent='Start'; elPause.disabled=true; } } },1000);
+              if(secs===0){ running=false; clearInterval(itv);
+                elTimer.classList.remove('running'); elTimer.classList.add('done');
+                try{ bell.play(); }catch(e){}
+                notify("Hết giờ Pomodoro!");
+                finishSession(sid,true); elStart.textContent='Start'; elPause.disabled=true; elReset.disabled=true;
+              } } },1000);
           }else{
             running=false; clearInterval(itv); elStart.textContent='Start';
+            elTimer.classList.remove('running');
             finishSession(sid, secs===0);
             elPause.disabled=true; elReset.disabled=true;
           }
         });
         elPause.addEventListener('click', ()=>{ paused=!paused; elPause.textContent=paused?'Resume':'Pause';});
-        elReset.addEventListener('click', ()=>{ secs=parseInt(elMin.value||25)*60; elTimer.textContent=fmt(secs);});
+        elReset.addEventListener('click', ()=>{ setMinutes(parseInt(elMin.value||25)); elTimer.classList.remove('running','done');});
         </script>
       </div>
     </div>
@@ -547,7 +573,7 @@ TPL_DASH = """
               <option>normal</option><option>high</option><option>low</option>
             </select>
           </div>
-          <div class="col-md-2"><input name="due_date" type="date" class="form-control"></div>
+          <div class="col-md-2"><input name="due_date" type="date" class="form-control" placeholder="dd/mm/yyyy"></div>
           <div class="col-md-2">
             <select name="project_id" class="form-select">
               <option value="">(project)</option>
@@ -560,7 +586,7 @@ TPL_DASH = """
         <hr>
         <div class="table-responsive">
           <table class="table align-middle">
-            <thead><tr><th>Title</th><th>Status</th><th>Est/Act</th><th>Priority</th><th>Due</th><th></th></tr></thead>
+            <thead><tr><th>Title</th><th>Status</th><th>Est/Act</th><th>Priority</th><th>Due</th><th class="text-end">Actions</th></tr></thead>
             <tbody>
               {% for t in tasks %}
               <tr>
@@ -578,14 +604,40 @@ TPL_DASH = """
                   </form>
                 </td>
                 <td class="mono">{{ t.estimate_pomos }}/{{ t.actual_pomos }}</td>
-                <td>{{ t.priority }}</td>
-                <td>{{ t.due_date or '' }}</td>
                 <td>
                   <form method="post" action="{{ url_for('update_task', task_id=t.id) }}" class="d-flex gap-2">
                     <input type="hidden" name="title" value="{{t.title}}">
                     <input type="hidden" name="description" value="{{t.description or ''}}">
+                    <input type="hidden" name="status" value="{{t.status}}">
+                    <select name="priority" class="form-select form-select-sm" onchange="this.form.submit()">
+                      {% for pz in ['low','normal','high'] %}
+                        <option value="{{pz}}" {% if t.priority==pz %}selected{% endif %}>{{pz}}</option>
+                      {% endfor %}
+                    </select>
+                  </form>
+                </td>
+                <td>
+                  <form method="post" action="{{ url_for('update_task', task_id=t.id) }}" class="d-flex gap-2">
+                    <input type="hidden" name="title" value="{{t.title}}">
+                    <input type="hidden" name="description" value="{{t.description or ''}}">
+                    <input type="hidden" name="status" value="{{t.status}}">
+                    <input type="hidden" name="priority" value="{{t.priority}}">
+                    <input type="date" name="due_date" class="form-control form-control-sm"
+                      value="{{ t.due_date.strftime('%Y-%m-%d') if t.due_date else '' }}"
+                      onchange="this.form.submit()">
+                  </form>
+                </td>
+                <td class="text-end">
+                  <form method="post" action="{{ url_for('update_task', task_id=t.id) }}" class="d-inline-flex gap-2">
+                    <input type="hidden" name="title" value="{{t.title}}">
+                    <input type="hidden" name="description" value="{{t.description or ''}}">
+                    <input type="hidden" name="status" value="{{t.status}}">
+                    <input type="hidden" name="priority" value="{{t.priority}}">
                     <input type="number" name="estimate_pomos" value="{{ t.estimate_pomos }}" class="form-control form-control-sm" style="width:90px;">
                     <button class="btn btn-sm btn-outline-primary">Save</button>
+                  </form>
+                  <form method="post" action="{{ url_for('delete_task', task_id=t.id) }}" class="d-inline" onsubmit="return confirm('Xóa task này?');">
+                    <button class="btn btn-sm btn-outline-danger ms-1">Delete</button>
                   </form>
                 </td>
               </tr>
@@ -614,6 +666,7 @@ TPL_DASH = """
 </div>
 {% endblock %}
 """
+
 TPL_TEAM = """
 {% extends 'base.html' %}{% block content %}
 <h4 class="mb-3">Team Dashboard <small class="text-muted">({{ rng }})</small></h4>
@@ -662,10 +715,3 @@ app.jinja_loader = DictLoader({
 # -------------------- Run --------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
-app.jinja_loader = DictLoader({
-    "base.html": TPL_BASE,
-    "login.html": TPL_LOGIN,
-    "register.html": TPL_REGISTER,
-    "dash.html": TPL_DASH,
-    "team.html": TPL_TEAM,
-})
