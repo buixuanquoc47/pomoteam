@@ -712,59 +712,114 @@ TPL_DASH = """
   // Đẩy màu chữ link khi ở dashboard
   document.querySelectorAll('a').forEach(a=>a.style.color='var(--ink)');
 
-  // Timer + modes
+  // ===== Timer chính xác khi chuyển tab (dùng endAt) =====
   const bell = new Audio("https://actions.google.com/sounds/v1/alarms/alarm_clock.ogg");
   if ("Notification" in window && Notification.permission === "default") Notification.requestPermission();
 
-  let secs=25*60, running=false, itv=null, sid=null, paused=false;
+  let running=false, paused=false, sid=null;
+  let endAt=0, remainMs=25*60*1000, tickHandle=null;
+
   const elTimer = document.getElementById('timer');
-  const elMin = document.getElementById('minutes');
+  const elMin   = document.getElementById('minutes');
   const elStart = document.getElementById('btnStart');
   const elPause = document.getElementById('btnPause');
   const elReset = document.getElementById('btnReset');
-  const elTask = document.getElementById('taskSelect');
+  const elTask  = document.getElementById('taskSelect');
 
-  const tabPom = document.getElementById('tabPomodoro');
+  const tabPom   = document.getElementById('tabPomodoro');
   const tabShort = document.getElementById('tabShort');
-  const tabLong = document.getElementById('tabLong');
+  const tabLong  = document.getElementById('tabLong');
 
-  function fmt(s){const m=Math.floor(s/60), r=s%60; return (m+'').padStart(2,'0')+':'+(r+'').padStart(2,'0');}
-  function setMinutes(m){ m=Math.max(1, m||25); secs=m*60; elMin.value=m; elTimer.textContent=fmt(secs); }
+  function fmtSeconds(s){
+    s = Math.max(0, Math.ceil(s));
+    const m = Math.floor(s/60), r = s%60;
+    return (m+'').padStart(2,'0')+':'+(r+'').padStart(2,'0');
+  }
+  function render(ms){ elTimer.textContent = fmtSeconds(ms/1000); }
+  function setMinutes(m){
+    m = Math.max(1, m||25);
+    remainMs = m*60*1000;
+    elMin.value = m;
+    render(remainMs);
+  }
   function setActive(tab){ [tabPom,tabShort,tabLong].forEach(b=>b.classList.remove('active')); tab.classList.add('active'); }
   function setMode(cls){ document.body.classList.remove('mode-pomo','mode-short','mode-long'); document.body.classList.add(cls); }
 
-  tabPom.onclick=()=>{ setActive(tabPom); setMinutes(25); setMode('mode-pomo'); };
-  tabShort.onclick=()=>{ setActive(tabShort); setMinutes(5);  setMode('mode-short'); };
-  tabLong.onclick=()=>{ setActive(tabLong); setMinutes(15); setMode('mode-long'); };
+  tabPom.onclick  = ()=>{ if(!running){ setActive(tabPom);  setMinutes(25); setMode('mode-pomo');  } };
+  tabShort.onclick= ()=>{ if(!running){ setActive(tabShort); setMinutes(5);  setMode('mode-short'); } };
+  tabLong.onclick = ()=>{ if(!running){ setActive(tabLong);  setMinutes(15); setMode('mode-long');  } };
 
-  elMin.addEventListener('change', e=> setMinutes(parseInt(e.target.value||25)));
+  elMin.addEventListener('change', e=>{ if(!running) setMinutes(parseInt(e.target.value||25)); });
 
   function notifyInline(msg){
-    if ("Notification" in window && Notification.permission === "granted"){ new Notification(msg); }
+    if ("Notification" in window && Notification.permission === "granted") new Notification(msg);
     else alert(msg);
+  }
+
+  function clearTick(){
+    if (tickHandle){ clearInterval(tickHandle); tickHandle=null; }
+  }
+  function startTick(){
+    clearTick();
+    tickHandle = setInterval(update, 250); // 250ms tick, không lệch vì tính theo endAt
+  }
+  function update(){
+    if (!running || paused) return;
+    const left = Math.max(0, endAt - Date.now());
+    render(left);
+    if (left <= 0){
+      running=false; paused=false; clearTick();
+      elStart.textContent='Start'; elPause.disabled=true; elReset.disabled=true;
+      elTimer.classList.remove('running'); elTimer.classList.add('done');
+      try{ bell.play(); }catch(e){}
+      notifyInline("Hết giờ!");
+      finishSession(sid,true);
+    }
   }
 
   elStart.addEventListener('click', async ()=>{
     if(!running){
-      sid = await startSession(elTask.value, parseInt(elMin.value||25));
-      running=true; paused=false;
+      const planned = parseInt(elMin.value||25);
+      sid = await startSession(elTask.value, planned);
+      remainMs = planned*60*1000;
+      endAt = Date.now() + remainMs;
+      running = true; paused = false;
       elTimer.classList.remove('done'); elTimer.classList.add('running');
       elPause.disabled=false; elReset.disabled=false; elStart.textContent='Stop';
-      itv=setInterval(()=>{ if(!paused){ secs=Math.max(0,secs-1); elTimer.textContent=fmt(secs);
-        if(secs===0){ running=false; clearInterval(itv);
-          elTimer.classList.remove('running'); elTimer.classList.add('done');
-          try{ bell.play(); }catch(e){}
-          notifyInline("Hết giờ!");
-          finishSession(sid,true); elStart.textContent='Start'; elPause.disabled=true; elReset.disabled=true;
-        } } },1000);
+      startTick(); update();
     }else{
-      running=false; clearInterval(itv); elStart.textContent='Start';
-      elTimer.classList.remove('running'); finishSession(sid, secs===0);
+      running=false; paused=false; clearTick();
+      elStart.textContent='Start'; elTimer.classList.remove('running');
+      const left = Math.max(0, endAt - Date.now());
+      render(left);
+      finishSession(sid, left<=1000);
       elPause.disabled=true; elReset.disabled=true;
     }
   });
-  elPause.addEventListener('click', ()=>{ paused=!paused; elPause.textContent=paused?'Resume':'Pause';});
-  elReset.addEventListener('click', ()=>{ setMinutes(parseInt(elMin.value||25)); elTimer.classList.remove('running','done');});
+
+  elPause.addEventListener('click', ()=>{
+    if (!running) return;
+    paused = !paused;
+    if (paused){
+      remainMs = Math.max(0, endAt - Date.now());
+      elPause.textContent='Resume';
+      clearTick();
+    }else{
+      endAt = Date.now() + remainMs;
+      elPause.textContent='Pause';
+      startTick(); update();
+    }
+  });
+
+  elReset.addEventListener('click', ()=>{
+    clearTick();
+    running=false; paused=false; elStart.textContent='Start';
+    elTimer.classList.remove('running','done');
+    setMinutes(parseInt(elMin.value||25));
+    elPause.disabled=true; elReset.disabled=true;
+  });
+
+  document.addEventListener('visibilitychange', ()=>{ if (!document.hidden) update(); });
 
   // ---- Pull notifications (every 20s) ----
   async function pullNoti(){
@@ -782,6 +837,9 @@ TPL_DASH = """
   }
   setInterval(pullNoti, 20000);
   pullNoti();
+
+  // Khởi tạo
+  setMinutes(25);
 </script>
 {% endblock %}
 """
