@@ -102,6 +102,12 @@ def leader_required(view):
         return view(*args, **kwargs)
     return wrapped
 
+def team_task_query(user):
+    """Tasks trong team nếu leader, còn lại chỉ của chính user."""
+    if user.role == "leader":
+        return Task.query.join(User, Task.assignee_id == User.id).filter(User.team_id == user.team_id)
+    return Task.query.filter(Task.assignee_id == user.id)
+
 # -------------------- Auth --------------------
 @app.route("/register", methods=["GET","POST"])
 def register():
@@ -141,20 +147,24 @@ def logout():
 @login_required
 def dashboard():
     me = current_user()
-    tasks = (Task.query
-             .filter(Task.assignee_id == me.id if me.role!="leader" else True)
-             .order_by(Task.created_at.desc()).all())
+    base_q = team_task_query(me).order_by(Task.created_at.desc())
+    active_tasks = base_q.filter(Task.status != "done").all()
+    done_tasks = base_q.filter(Task.status == "done").all()
+
     start_of_day = datetime.datetime.combine(datetime.date.today(), datetime.time(0,0,0))
     sessions_today = (FocusSession.query
                       .filter(FocusSession.user_id==me.id, FocusSession.start_time>=start_of_day)
                       .all())
     mins_today = sum(s.actual_minutes or 0 for s in sessions_today)
     pomos_today = sum(1 for s in sessions_today if s.was_completed)
+
     projects = Project.query.filter_by(team_id=me.team_id).order_by(Project.name).all()
     team_users = User.query.filter_by(team_id=me.team_id).all()
+    active_tab = request.args.get("tab","active")
     return render_template("dash.html", APP_NAME="PomoTeam",
-                           me=me, tasks=tasks, mins_today=mins_today,
-                           pomos_today=pomos_today, projects=projects, team_users=team_users)
+                           me=me, tasks_active=active_tasks, tasks_done=done_tasks,
+                           mins_today=mins_today, pomos_today=pomos_today,
+                           projects=projects, team_users=team_users, active_tab=active_tab)
 
 @app.route("/team")
 @login_required
@@ -184,7 +194,6 @@ def team_dashboard():
         acc = (act/est*100) if est>0 else 0
         members_stats.append(dict(user=u, focus_minutes=mins, pomos=pomos,
                                   tasks_done=tasks_done, estimate_accuracy=round(acc,1)))
-    # ranking theo focus minutes
     members_stats.sort(key=lambda m: m["focus_minutes"], reverse=True)
     blocked = (Task.query
                .filter(Task.project_id.in_([p.id for p in Project.query.filter_by(team_id=me.team_id)]),
@@ -263,7 +272,18 @@ def mark_done(task_id):
     t.status = "done"
     t.actual_pomos = (t.actual_pomos or 0) + 1
     db.session.commit()
-    return redirect(url_for("dashboard"))
+    # chuyển sang tab done
+    return redirect(url_for("dashboard", tab="done"))
+
+@app.route("/tasks/<int:task_id>/restore", methods=["POST"])
+@login_required
+def restore_task(task_id):
+    me = current_user()
+    t = Task.query.get_or_404(task_id)
+    if me.role != "leader" and t.assignee_id != me.id: abort(403)
+    t.status = "todo"
+    db.session.commit()
+    return redirect(url_for("dashboard", tab="active"))
 
 # -------------------- Projects (CRUD) --------------------
 @app.route("/projects/create", methods=["POST"], endpoint="create_project")
@@ -373,16 +393,11 @@ TPL_BASE = """
 <script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.6.0/dist/confetti.browser.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <style>
-  /* Theme variables */
-  :root{
-    --bg:#c94b4b;       /* pomodoro */
-    --card:rgba(255,255,255,0.12);
-    --ink:#fff;
-  }
+  :root{ --bg:#c94b4b; --card:rgba(255,255,255,0.12); --ink:#fff; }
   body.mode-pomo { --bg:#c94b4b; --card:rgba(255,255,255,0.12); --ink:#fff; }
-  body.mode-short{ --bg:#4e89ae; --card:rgba(255,255,255,0.12); --ink:#fff; }   /* xanh biển */
-  body.mode-long { --bg:#4caf50; --card:rgba(255,255,255,0.12); --ink:#fff; }   /* xanh lá */
-  body.mode-report{ --bg:#ffffff; --card:#ffffff; --ink:#212529; }              /* report trắng */
+  body.mode-short{ --bg:#4e89ae; --card:rgba(255,255,255,0.12); --ink:#fff; }
+  body.mode-long { --bg:#4caf50; --card:rgba(255,255,255,0.12); --ink:#fff; }
+  body.mode-report{ --bg:#ffffff; --card:#ffffff; --ink:#212529; }
 
   body { background: var(--bg); color: var(--ink); }
   .navbar, .card { background: var(--card) !important; color: var(--ink); border: none; }
@@ -400,10 +415,8 @@ TPL_BASE = """
   table thead th { color:var(--ink); }
   .table { color:var(--ink); }
   .btn-delete { background:#dc3545; color:#fff; border:none; }
-  /* khung cuộn */
   .scroll-tasks { max-height: 360px; overflow:auto; }
   .scroll-projects { max-height: 150px; overflow:auto; }
-  /* chuyển sang màu chữ đen khi report */
   body.mode-report .navbar, body.mode-report .card { border:1px solid #e9ecef !important; }
 </style>
 </head>
@@ -446,9 +459,7 @@ async function finishSession(sessionId, completed=true, notes=''){
   });
   return await res.json();
 }
-function boomConfetti(){
-  try{ confetti({particleCount:120, spread:70, origin:{y:0.6}}); }catch(e){}
-}
+function boomConfetti(){ try{ confetti({particleCount:120, spread:70, origin:{y:0.6}}); }catch(e){} }
 </script>
 </body></html>
 """
@@ -519,7 +530,7 @@ TPL_DASH = """
             <label class="form-label">Task</label>
             <select id="taskSelect" class="form-select">
               <option value="">(no task)</option>
-              {% for t in tasks %}<option value="{{t.id}}">{{ t.title }}</option>{% endfor %}
+              {% for t in tasks_active %}<option value="{{t.id}}">{{ t.title }}</option>{% endfor %}
             </select>
           </div>
           <div class="col-md-6">
@@ -553,7 +564,15 @@ TPL_DASH = """
   <div class="col-lg-6">
     <div class="card shadow-sm mb-3">
       <div class="card-body">
-        <h5 class="mb-3">My Tasks</h5>
+        <div class="d-flex justify-content-between align-items-center">
+          <h5 class="mb-3">My Tasks</h5>
+          <ul class="nav nav-pills">
+            <li class="nav-item"><a id="tabActiveBtn" class="nav-link {% if active_tab!='done' %}active{% endif %}" href="#!" onclick="showTab('active')">Active</a></li>
+            <li class="nav-item"><a id="tabDoneBtn" class="nav-link {% if active_tab=='done' %}active{% endif %}" href="#!" onclick="showTab('done')">Done</a></li>
+          </ul>
+        </div>
+
+        <!-- Form tạo task -->
         <form class="row g-2" method="post" action="{{ url_for('create_task') }}">
           <div class="col-md-3">
             <label class="form-label">Task title</label>
@@ -598,20 +617,19 @@ TPL_DASH = """
         </form>
 
         <hr>
-        <div class="table-responsive scroll-tasks">
+
+        <!-- ACTIVE LIST -->
+        <div id="panelActive" class="table-responsive scroll-tasks" {% if active_tab=='done' %}style="display:none"{% endif %}>
           <table class="table align-middle">
             <thead><tr><th>Title</th><th>Status</th><th>Est/Act</th><th>Priority</th><th>Due</th>{% if me.role=='leader' %}<th>Assignee</th>{% endif %}<th class="text-end">Actions</th></tr></thead>
             <tbody>
-              {% for t in tasks %}
+              {% for t in tasks_active %}
               <tr>
-                <td>
-                  <div class="fw-semibold">{{ t.title }}</div>
-                  <div class="small text-muted">{{ t.description or '' }}</div>
-                </td>
+                <td><div class="fw-semibold">{{ t.title }}</div><div class="small text-muted">{{ t.description or '' }}</div></td>
                 <td>
                   <form method="post" action="{{ url_for('update_task', task_id=t.id) }}">
                     <select name="status" class="form-select form-select-sm" onchange="this.form.submit()">
-                      {% for s in ['todo','doing','done','blocked'] %}
+                      {% for s in ['todo','doing','blocked'] %}
                         <option value="{{s}}" {% if t.status==s %}selected{% endif %}>{{s}}</option>
                       {% endfor %}
                     </select>
@@ -673,11 +691,38 @@ TPL_DASH = """
                 </td>
               </tr>
               {% else %}
-              <tr><td colspan="7" class="text-muted">No tasks yet.</td></tr>
+              <tr><td colspan="7" class="text-muted">No active tasks.</td></tr>
               {% endfor %}
             </tbody>
           </table>
         </div>
+
+        <!-- DONE LIST -->
+        <div id="panelDone" class="table-responsive scroll-tasks" {% if active_tab!='done' %}style="display:none"{% endif %}>
+          <table class="table align-middle">
+            <thead><tr><th>Title</th><th>Est/Act</th><th>Project</th><th class="text-end">Actions</th></tr></thead>
+            <tbody>
+              {% for t in tasks_done %}
+              <tr>
+                <td><div class="fw-semibold">{{ t.title }}</div><div class="small text-muted">{{ t.description or '' }}</div></td>
+                <td class="mono">{{ t.estimate_pomos }}/{{ t.actual_pomos }}</td>
+                <td>{{ t.project.name if t.project else '-' }}</td>
+                <td class="text-end">
+                  <form method="post" action="{{ url_for('restore_task', task_id=t.id) }}" class="d-inline">
+                    <button class="btn btn-sm btn-outline-light">Restore</button>
+                  </form>
+                  <form method="post" action="{{ url_for('delete_task', task_id=t.id) }}" class="d-inline" onsubmit="return confirm('Xóa task này?');">
+                    <button class="btn btn-sm btn-delete ms-1">Delete</button>
+                  </form>
+                </td>
+              </tr>
+              {% else %}
+              <tr><td colspan="4" class="text-muted">No done tasks.</td></tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+
       </div>
     </div>
 
@@ -709,10 +754,9 @@ TPL_DASH = """
 </div>
 
 <script>
-  // Đẩy màu chữ link khi ở dashboard
   document.querySelectorAll('a').forEach(a=>a.style.color='var(--ink)');
 
-  // ===== Timer chính xác khi chuyển tab (dùng endAt) =====
+  // ===== Timer chính xác (endAt) =====
   const bell = new Audio("https://actions.google.com/sounds/v1/alarms/alarm_clock.ogg");
   if ("Notification" in window && Notification.permission === "default") Notification.requestPermission();
 
@@ -730,18 +774,9 @@ TPL_DASH = """
   const tabShort = document.getElementById('tabShort');
   const tabLong  = document.getElementById('tabLong');
 
-  function fmtSeconds(s){
-    s = Math.max(0, Math.ceil(s));
-    const m = Math.floor(s/60), r = s%60;
-    return (m+'').padStart(2,'0')+':'+(r+'').padStart(2,'0');
-  }
+  function fmtSeconds(s){ s=Math.max(0,Math.ceil(s)); const m=Math.floor(s/60), r=s%60; return (m+'').padStart(2,'0')+':'+(r+'').padStart(2,'0'); }
   function render(ms){ elTimer.textContent = fmtSeconds(ms/1000); }
-  function setMinutes(m){
-    m = Math.max(1, m||25);
-    remainMs = m*60*1000;
-    elMin.value = m;
-    render(remainMs);
-  }
+  function setMinutes(m){ m=Math.max(1,m||25); remainMs=m*60*1000; elMin.value=m; render(remainMs); }
   function setActive(tab){ [tabPom,tabShort,tabLong].forEach(b=>b.classList.remove('active')); tab.classList.add('active'); }
   function setMode(cls){ document.body.classList.remove('mode-pomo','mode-short','mode-long'); document.body.classList.add(cls); }
 
@@ -751,23 +786,14 @@ TPL_DASH = """
 
   elMin.addEventListener('change', e=>{ if(!running) setMinutes(parseInt(e.target.value||25)); });
 
-  function notifyInline(msg){
-    if ("Notification" in window && Notification.permission === "granted") new Notification(msg);
-    else alert(msg);
-  }
-
-  function clearTick(){
-    if (tickHandle){ clearInterval(tickHandle); tickHandle=null; }
-  }
-  function startTick(){
-    clearTick();
-    tickHandle = setInterval(update, 250); // 250ms tick, không lệch vì tính theo endAt
-  }
+  function notifyInline(msg){ if ("Notification" in window && Notification.permission === "granted") new Notification(msg); else alert(msg); }
+  function clearTick(){ if(tickHandle){ clearInterval(tickHandle); tickHandle=null; } }
+  function startTick(){ clearTick(); tickHandle=setInterval(update,250); }
   function update(){
-    if (!running || paused) return;
-    const left = Math.max(0, endAt - Date.now());
+    if(!running || paused) return;
+    const left=Math.max(0,endAt-Date.now());
     render(left);
-    if (left <= 0){
+    if(left<=0){
       running=false; paused=false; clearTick();
       elStart.textContent='Start'; elPause.disabled=true; elReset.disabled=true;
       elTimer.classList.remove('running'); elTimer.classList.add('done');
@@ -779,47 +805,33 @@ TPL_DASH = """
 
   elStart.addEventListener('click', async ()=>{
     if(!running){
-      const planned = parseInt(elMin.value||25);
-      sid = await startSession(elTask.value, planned);
-      remainMs = planned*60*1000;
-      endAt = Date.now() + remainMs;
-      running = true; paused = false;
+      const planned=parseInt(elMin.value||25);
+      sid=await startSession(elTask.value, planned);
+      remainMs=planned*60*1000;
+      endAt=Date.now()+remainMs;
+      running=true; paused=false;
       elTimer.classList.remove('done'); elTimer.classList.add('running');
       elPause.disabled=false; elReset.disabled=false; elStart.textContent='Stop';
       startTick(); update();
     }else{
       running=false; paused=false; clearTick();
       elStart.textContent='Start'; elTimer.classList.remove('running');
-      const left = Math.max(0, endAt - Date.now());
-      render(left);
-      finishSession(sid, left<=1000);
-      elPause.disabled=true; elReset.disabled=true;
+      const left=Math.max(0,endAt-Date.now()); render(left);
+      finishSession(sid,left<=1000); elPause.disabled=true; elReset.disabled=true;
     }
   });
-
   elPause.addEventListener('click', ()=>{
-    if (!running) return;
-    paused = !paused;
-    if (paused){
-      remainMs = Math.max(0, endAt - Date.now());
-      elPause.textContent='Resume';
-      clearTick();
-    }else{
-      endAt = Date.now() + remainMs;
-      elPause.textContent='Pause';
-      startTick(); update();
-    }
+    if(!running) return;
+    paused=!paused;
+    if(paused){ remainMs=Math.max(0,endAt-Date.now()); elPause.textContent='Resume'; clearTick(); }
+    else{ endAt=Date.now()+remainMs; elPause.textContent='Pause'; startTick(); update(); }
   });
-
   elReset.addEventListener('click', ()=>{
-    clearTick();
-    running=false; paused=false; elStart.textContent='Start';
-    elTimer.classList.remove('running','done');
-    setMinutes(parseInt(elMin.value||25));
+    clearTick(); running=false; paused=false; elStart.textContent='Start';
+    elTimer.classList.remove('running','done'); setMinutes(parseInt(elMin.value||25));
     elPause.disabled=true; elReset.disabled=true;
   });
-
-  document.addEventListener('visibilitychange', ()=>{ if (!document.hidden) update(); });
+  document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) update(); });
 
   // ---- Pull notifications (every 20s) ----
   async function pullNoti(){
@@ -835,10 +847,19 @@ TPL_DASH = """
       }
     }catch(e){}
   }
-  setInterval(pullNoti, 20000);
-  pullNoti();
+  setInterval(pullNoti, 20000); pullNoti();
 
-  // Khởi tạo
+  // Tab switching
+  function showTab(which){
+    document.getElementById('panelActive').style.display = which==='active' ? '' : 'none';
+    document.getElementById('panelDone').style.display   = which==='done'   ? '' : 'none';
+    document.getElementById('tabActiveBtn').classList.toggle('active', which==='active');
+    document.getElementById('tabDoneBtn').classList.toggle('active', which==='done');
+    history.replaceState({}, '', `/?tab=${which}`);
+  }
+  showTab('{{ active_tab=="done" and "done" or "active" }}');
+
+  // Init
   setMinutes(25);
 </script>
 {% endblock %}
@@ -855,24 +876,9 @@ TPL_TEAM = """
 </div>
 
 <div class="row g-4">
-  <div class="col-lg-6">
-    <div class="card p-3">
-      <h6 class="text-dark">Focus Minutes by User</h6>
-      <canvas id="chartMins" height="140"></canvas>
-    </div>
-  </div>
-  <div class="col-lg-6">
-    <div class="card p-3">
-      <h6 class="text-dark">Pomos by User</h6>
-      <canvas id="chartPomos" height="140"></canvas>
-    </div>
-  </div>
-  <div class="col-lg-6">
-    <div class="card p-3">
-      <h6 class="text-dark">Tasks Done by User</h6>
-      <canvas id="chartDone" height="140"></canvas>
-    </div>
-  </div>
+  <div class="col-lg-6"><div class="card p-3"><h6 class="text-dark">Focus Minutes by User</h6><canvas id="chartMins" height="140"></canvas></div></div>
+  <div class="col-lg-6"><div class="card p-3"><h6 class="text-dark">Pomos by User</h6><canvas id="chartPomos" height="140"></canvas></div></div>
+  <div class="col-lg-6"><div class="card p-3"><h6 class="text-dark">Tasks Done by User</h6><canvas id="chartDone" height="140"></canvas></div></div>
 </div>
 
 <div class="table-responsive mt-4">
@@ -909,17 +915,12 @@ TPL_TEAM = """
   const mins = {{ chart_mins|tojson }};
   const pomos = {{ chart_pomos|tojson }};
   const done = {{ chart_done|tojson }};
-
   function mkBar(id, data, color){
-    new Chart(document.getElementById(id), {
-      type: 'bar',
-      data: { labels, datasets: [{ data, backgroundColor: color }] },
-      options: { plugins:{legend:{display:false}}, scales:{y:{beginAtZero:true}} }
-    });
+    new Chart(document.getElementById(id), { type:'bar',
+      data:{ labels, datasets:[{ data, backgroundColor: color }] },
+      options:{ plugins:{legend:{display:false}}, scales:{y:{beginAtZero:true}} }});
   }
-  mkBar('chartMins', mins, '#4e79a7');
-  mkBar('chartPomos', pomos, '#59a14f');
-  mkBar('chartDone', done, '#e15759');
+  mkBar('chartMins', mins, '#4e79a7'); mkBar('chartPomos', pomos, '#59a14f'); mkBar('chartDone', done, '#e15759');
 </script>
 {% endblock %}
 """
